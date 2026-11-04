@@ -33,7 +33,8 @@ def main() -> int:
     r.add_argument("--strength", type=float, default=0.99)
     r.add_argument("--grow", type=int, help="pixels to widen the mask by (default: from the block size)")
     r.add_argument("--seed", type=int)
-    r.add_argument("--model", default="anime", help="model name or path ('anime', 'general', etc.)")
+    r.add_argument("--model", default="er0manga", help="model name or path ('er0manga' [default], 'hybrid', 'animagine', 'lama')")
+    r.add_argument("--out-dir", default=None, help="custom output directory")
     r.add_argument("--style", default="auto", help="prompt style preset ('auto', 'anime', 'general')")
     r.add_argument("--anatomy", default="auto", choices=["auto", "female", "male", "none"],
                    help="anatomical prompt preset for anime decensoring ('auto', 'female', 'male', 'none')")
@@ -49,7 +50,7 @@ def main() -> int:
         return 0
 
     paths = pl.list_images(target) if target.is_dir() else [pl.check_image_path(a.path)]
-    out_dir = pl.OUT_DIR / target.name if target.is_dir() else pl.OUT_DIR
+    out_dir = Path(a.out_dir).expanduser() if a.out_dir else (pl.OUT_DIR / target.name if target.is_dir() else pl.OUT_DIR)
     inpainter = Inpainter(model_dir=a.model)
     boxes = [pl.parse_boxes(b)[0] for b in a.box]
     uncensored_count = 0
