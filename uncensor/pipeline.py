@@ -16,7 +16,7 @@ from .detect import Region, detect_all, grow_mask, manual_mask, preview
 from .inpaint import Inpainter
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".png_", ".rpgmvp", ".rpgmvo"}
-OUT_DIR = Path(os.environ.get("UNCENSOR_OUT_DIR") or Path.home() / "Pictures" / "odysseus-uncensor")
+OUT_DIR = Path(os.environ.get("UNCENSOR_OUT_DIR") or Path.home() / "Downloads" / "odysseus-decensor")
 
 PNG_MAGIC = bytes([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52])
 RPGMV_HEADER = b"RPGMV\x00\x00\x00\x00\x03\x01\x00\x00\x00\x00\x00"
@@ -39,12 +39,100 @@ def load_rgb(path: Path | str) -> np.ndarray:
 
 
 def check_image_path(text: str) -> Path:
-    path = Path(text).expanduser()
-    if not path.is_file():
-        raise ValueError(f"no such file: {text}")
-    if path.suffix.lower() not in IMAGE_EXTS:
-        raise ValueError(f"not an image type I handle: {path.suffix}")
-    return path
+    raw = str(text or "").strip()
+    if raw:
+        p = Path(raw).expanduser()
+        if p.is_file():
+            if p.suffix.lower() not in IMAGE_EXTS:
+                raise ValueError(f"not an image type I handle: {p.suffix}")
+            return p
+
+    # Check Odysseus uploads manifest if available
+    odysseus_uploads = Path(__file__).resolve().parent.parent.parent / "Odysseus" / "data" / "uploads"
+    uploads_json = odysseus_uploads / "uploads.json"
+    if uploads_json.is_file():
+        try:
+            import json
+            meta = json.loads(uploads_json.read_text())
+            clean_q = Path(raw).name.lower() if raw else ""
+            generic_terms = {"it", "this", "image", "the image", "attached", "latest", "file", "photo", "pic", "the picture", ""}
+            if not raw or clean_q in generic_terms:
+                candidates = []
+                for v in meta.values():
+                    p_str = v.get("path") or ""
+                    if p_str.startswith("/app/data/uploads/"):
+                        p_str = str(odysseus_uploads / p_str[len("/app/data/uploads/"):])
+                    lp = Path(p_str)
+                    if lp.is_file() and lp.suffix.lower() in IMAGE_EXTS:
+                        candidates.append((lp.stat().st_mtime, lp))
+                if candidates:
+                    candidates.sort(key=lambda x: x[0], reverse=True)
+                    return candidates[0][1]
+            else:
+                matches = []
+                for v in meta.values():
+                    name = str(v.get("name") or "").lower()
+                    uid = str(v.get("id") or "").lower()
+                    if clean_q in (name, uid) or Path(clean_q).stem in (Path(name).stem, Path(uid).stem):
+                        p_str = v.get("path") or ""
+                        if p_str.startswith("/app/data/uploads/"):
+                            p_str = str(odysseus_uploads / p_str[len("/app/data/uploads/"):])
+                        lp = Path(p_str)
+                        if lp.is_file() and lp.suffix.lower() in IMAGE_EXTS:
+                            uploaded_time = str(v.get("uploaded_at") or v.get("created_at") or "")
+                            mtime = lp.stat().st_mtime
+                            matches.append((uploaded_time, mtime, lp))
+                if matches:
+                    matches.sort(key=lambda x: (x[0], x[1]), reverse=True)
+                    return matches[0][2]
+        except Exception:
+            pass
+
+    # Candidate directories to resolve uploaded files or relative names
+    candidate_dirs = [
+        odysseus_uploads,
+        Path.home() / "Downloads",
+        Path.home() / "Downloads" / "odysseus-decensor",
+        Path.home() / "Pictures",
+        Path.home() / "Pictures" / "odysseus-uncensor",
+        Path.home() / "Documents" / "TEST" / "pictures",
+        Path.cwd(),
+    ]
+
+    generic_terms = {"it", "this", "image", "the image", "attached", "latest", "file", "photo", "pic", "the picture", ""}
+    low = raw.lower()
+    if low in generic_terms or not raw:
+        for cdir in candidate_dirs:
+            if cdir.is_dir():
+                found_images = [
+                    f for f in cdir.iterdir()
+                    if f.is_file() and f.suffix.lower() in IMAGE_EXTS and not f.name.startswith(".")
+                ]
+                if found_images:
+                    found_images.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+                    return found_images[0]
+
+    clean_name = Path(raw).name
+    for cdir in candidate_dirs:
+        if not cdir.is_dir():
+            continue
+        direct = cdir / clean_name
+        if direct.is_file() and direct.suffix.lower() in IMAGE_EXTS:
+            return direct
+        for f in cdir.iterdir():
+            if f.is_file() and f.suffix.lower() in IMAGE_EXTS:
+                if clean_name.lower() in f.name.lower() or f.stem.lower() == Path(clean_name).stem.lower():
+                    return f
+
+    if raw:
+        p = Path(raw).expanduser()
+        if not p.is_file():
+            raise ValueError(f"no such file: {text}")
+        if p.suffix.lower() not in IMAGE_EXTS:
+            raise ValueError(f"not an image type I handle: {p.suffix}")
+        return p
+
+    raise ValueError("no image path provided and no recent upload found")
 
 
 def parse_boxes(text: str) -> list[tuple[int, int, int, int]]:
@@ -67,7 +155,7 @@ def free_name(directory: Path, stem: str, suffix: str) -> Path:
     return candidate
 
 
-def find_regions(path: Path, kinds=("mosaic", "bars"), boxes=None, mask_path: Path | None = None):
+def find_regions(path: Path, kinds=("mosaic", "bars", "spots"), boxes=None, mask_path: Path | None = None):
     """(rgb, regions, mask) from a manual mask file, manual boxes, or automatic detection."""
     rgb = load_rgb(path)
     if mask_path is not None:
@@ -97,7 +185,7 @@ def write_preview(path: Path, rgb, regions, mask, out_dir: Path = OUT_DIR) -> Pa
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm"}
 
 
-def uncensor(path: Path, inpainter: Inpainter, *, out_dir: Path = OUT_DIR, kinds=("mosaic", "bars"), boxes=None,
+def uncensor(path: Path, inpainter: Inpainter, *, out_dir: Path = OUT_DIR, kinds=("mosaic", "bars", "spots"), boxes=None,
              mask_path: Path | None = None, prompt: str = "", negative: str = "", steps: int = 30,
              guidance: float = 7.5, strength: float = 0.99, grow: int | None = None, seed: int | None = None,
              max_regions: int = 48, model: str | Path | None = None, style: str = "auto", anatomy: str = "auto",
@@ -121,7 +209,7 @@ def uncensor(path: Path, inpainter: Inpainter, *, out_dir: Path = OUT_DIR, kinds
     return {"output": str(target), "regions": describe(regions), "seconds": round(time.time() - started, 1)}
 
 
-def uncensor_video(path: Path, inpainter: Inpainter, *, out_dir: Path = OUT_DIR, kinds=("mosaic", "bars"),
+def uncensor_video(path: Path, inpainter: Inpainter, *, out_dir: Path = OUT_DIR, kinds=("mosaic", "bars", "spots"),
                    prompt: str = "", negative: str = "", steps: int = 20, guidance: float = 7.5,
                    strength: float = 0.99, model: str | Path | None = None, style: str = "auto",
                    anatomy: str = "auto", progress: Callable[[str], None] | None = None) -> dict:

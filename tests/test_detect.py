@@ -8,6 +8,7 @@ import io
 import sys
 from pathlib import Path
 
+import cv2
 import numpy as np
 from PIL import Image, ImageDraw
 
@@ -108,6 +109,12 @@ check("bar on photo", score >= 0.9 and len(regions) == 1, f"IoU={score:.2f} n={l
 page = procedural(panel=(0, 0, 0))
 regions, _ = detect_bars(page)
 check("bars on page: 4 black panels found, gradient and frames ignored", len(regions) == 4, f"n={len(regions)} {[(r.x, r.y, r.w, r.h) for r in regions]}")
+
+# 4. White censor spot on skin tone.
+skin_patch = np.full((300, 300, 3), (245, 205, 195), dtype=np.uint8)
+cv2.circle(skin_patch, (150, 150), 16, (255, 255, 255), -1)
+regions, mask = detect_all(skin_patch, kinds=("spots",))
+check("white spot on skin tone", len(regions) == 1 and regions[0].kind == "spot", f"n={len(regions)} regions={[(r.kind, r.x, r.y, r.w, r.h) for r in regions]}")
 
 print("\nFAILED: " + ", ".join(failures) if failures else "\nall passed")
 sys.exit(1 if failures else 0)

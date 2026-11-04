@@ -243,20 +243,75 @@ def detect_bars(rgb: np.ndarray, dark: int = 16, min_thick: int = 10, min_len: i
     return regions, mask
 
 
+# ------------------------------------------------------------------ white censor bars and spots
+
+def detect_white_censor(rgb: np.ndarray, min_area: int = 80, max_frac: float = 0.25):
+    """Solid near-white censor stickers/dots or white censor bars on figures.
+    Rejects normal page white borders and flat highlights by checking surrounding contrast and hue."""
+    h, w = rgb.shape[:2]
+    bright = (rgb.min(axis=2) >= 222).astype(np.uint8)
+    bright = cv2.morphologyEx(bright, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(bright, connectivity=8)
+    regions: list[Region] = []
+    mask = np.zeros((h, w), np.uint8)
+    for k in range(1, count):
+        x, y, bw, bh, area = (int(v) for v in stats[k])
+        if area < min_area or bw * bh > max_frac * h * w:
+            continue
+        if bw >= 0.9 * w or bh >= 0.9 * h:
+            continue
+        comp = (labels == k).astype(np.uint8)
+        dilated = cv2.dilate(comp, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+        ring = (dilated > 0) & (comp == 0)
+        if ring.sum() < 20:
+            continue
+        ring_rgb = rgb[ring]
+        contrast = float(rgb[comp == 1].mean()) - float(ring_rgb.mean())
+        if contrast < 20:
+            continue
+        if (ring_rgb.min(axis=1) >= 215).mean() > 0.40:
+            continue
+
+        fill_ratio = area / (bw * bh)
+        r_mean = ring_rgb[:, 0].mean()
+        g_mean = ring_rgb[:, 1].mean()
+        b_mean = ring_rgb[:, 2].mean()
+        ring_redness = r_mean - max(g_mean, b_mean)
+
+        is_white_bar = (fill_ratio >= 0.82) and (max(bw, bh) >= 30) and (min(bw, bh) >= 10)
+        is_censor_spot = (fill_ratio >= 0.55) and (ring_redness >= 16) and (area >= 120) and (max(bw, bh) >= 20)
+
+        if is_white_bar or is_censor_spot:
+            pad = 6
+            px, py = max(0, x - pad), max(0, y - pad)
+            pw, ph = min(w - px, bw + 2 * pad), min(h - py, bh + 2 * pad)
+            mask[comp == 1] = 255
+            regions.append(Region(px, py, pw, ph, "bar" if is_white_bar else "spot"))
+    return regions, mask
+
+
 # ------------------------------------------------------------------ combining
 
-def detect_all(rgb: np.ndarray, kinds: tuple[str, ...] = ("mosaic", "bars"), **mosaic_args):
+def detect_all(rgb: np.ndarray, kinds: tuple[str, ...] = ("mosaic", "bars", "spots"), **mosaic_args):
     regions: list[Region] = []
     mask = np.zeros(rgb.shape[:2], np.uint8)
     if "mosaic" in kinds:
         r, m = detect_mosaic(rgb, **mosaic_args)
         regions += r
         mask |= m
-    if "bars" in kinds:
+    if "bars" in kinds or "black" in kinds:
         r, m = detect_bars(rgb)
         regions += r
         mask |= m
-    return regions, mask
+    if "bars" in kinds or "spots" in kinds or "white" in kinds:
+        r, m = detect_white_censor(rgb)
+        if "spots" not in kinds and "white" not in kinds:
+            r = [reg for reg in r if reg.kind == "bar"]
+        elif "bars" not in kinds and "white" not in kinds:
+            r = [reg for reg in r if reg.kind == "spot"]
+        regions += r
+        mask |= m
+    return _merge_regions(regions), mask
 
 
 def manual_mask(shape: tuple[int, int], boxes: list[tuple[int, int, int, int]]):

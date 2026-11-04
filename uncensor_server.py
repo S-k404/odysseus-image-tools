@@ -3,7 +3,7 @@ uncensor_server.py
 
 MCP server for Odysseus: find mosaic / black-bar censoring in an image and fill it in with a local
 inpainting model (SDXL on the Mac's GPU). Small tool schemas and compact outputs so local models
-can drive it. Originals are never modified; results go to ~/Pictures/odysseus-uncensor.
+can drive it. Originals are never modified; results go to ~/Downloads/odysseus-decensor.
 """
 
 import asyncio
@@ -32,25 +32,27 @@ PROMPT_HELP = ("What should be in the covered area, in plain words (e.g. 'a whit
 TOOLS = [
     Tool(
         name="find_censored_regions",
-        description="Look for mosaic (pixelation) and black censor bars in a manga panel or image. Changes nothing; writes a preview "
+        description="Look for mosaic (pixelation), black censor bars, and white censor spots in a manga panel or image. Changes nothing; writes a preview "
                     "with the regions outlined and numbered, and lists them with x, y, width, height.",
         inputSchema={"type": "object", "properties": {
-            "image_path": {"type": "string", "description": "Full path of the image (png, jpg, webp, png_)"},
-            "kinds": {"type": "string", "description": "mosaic, bars or 'mosaic,bars' (default both)"},
+            "image_path": {"type": "string", "description": "Full path of the image (or relative filename / upload id, or 'it'/'latest' for latest upload)"},
+            "kinds": {"type": "string", "description": "mosaic, bars, spots or comma-separated combination (default 'mosaic,bars,spots')"},
+            "output_dir": {"type": "string", "description": "Optional: custom directory for preview output (default ~/Downloads/odysseus-decensor)"},
         }, "required": ["image_path"]},
     ),
     Tool(
         name="uncensor_image",
-        description="Decensor / uncensor an image or manga panel by removing mosaic pixelation and black censor bars using AI inpainting (Animagine XL / SDXL). "
-                    "It invents plausible detail, it cannot recover what was hidden. Finds the regions itself unless "
-                    "'regions' or 'mask_path' is given. Saves a new file; the original is untouched. Takes 15-40 s.",
+        description="Decensor / uncensor an image or manga panel by removing mosaic pixelation, black censor bars, or white censor spots using AI inpainting (default Er0manga FFC in ~0.3s). "
+                    "It invents plausible detail matching anime/manga art. Finds the regions itself unless "
+                    "'regions' or 'mask_path' is given. Saves a new file to ~/Downloads/odysseus-decensor (or specified output_dir); the original is untouched.",
         inputSchema={"type": "object", "properties": {
-            "image_path": {"type": "string", "description": "Full path of the image"},
+            "image_path": {"type": "string", "description": "Full path of the image (or relative filename / upload id, or 'it'/'latest' for latest upload)"},
             "prompt": {"type": "string", "description": PROMPT_HELP},
+            "output_dir": {"type": "string", "description": "Optional: directory where output is saved (default ~/Downloads/odysseus-decensor)"},
             "regions": {"type": "string", "description": "Optional: your own areas as 'x,y,w,h;x,y,w,h' (skips detection)"},
             "mask_path": {"type": "string", "description": "Optional: mask image, white = fill in (skips detection)"},
-            "kinds": {"type": "string", "description": "What to detect: mosaic, bars or 'mosaic,bars' (default both)"},
-            "model": {"type": "string", "description": "Model to use: 'anime' (default, specialized for manga/anime) or 'general' (SDXL photorealistic)"},
+            "kinds": {"type": "string", "description": "What to detect: mosaic, bars, spots or comma-separated combination (default 'mosaic,bars,spots')"},
+            "model": {"type": "string", "description": "Model to use: 'er0manga' (default, fastest ~0.3s high-quality anime inpainting), 'hybrid', 'anime' (Animagine XL SDXL), or 'general' (SDXL photorealistic)"},
             "style": {"type": "string", "description": "Style prompt preset: 'auto' (default), 'anime' or 'general'"},
             "anatomy": {"type": "string", "description": "Anatomy prompt preset: 'auto' (default, auto-detects male vs female), 'female', 'male', or 'none'"},
             "steps": {"type": "integer", "description": "Quality vs speed, 15-50 (default 30)"},
@@ -59,14 +61,15 @@ TOOLS = [
     ),
     Tool(
         name="decensor_image",
-        description="Alias for uncensor_image: Decensor / uncensor a manga panel or image by removing mosaic or black bars using AI inpainting.",
+        description="Alias for uncensor_image: Decensor / uncensor a manga panel or image by removing mosaic, black bars, or white spots using AI inpainting. Saves to ~/Downloads/odysseus-decensor.",
         inputSchema={"type": "object", "properties": {
-            "image_path": {"type": "string", "description": "Full path of the image"},
+            "image_path": {"type": "string", "description": "Full path of the image (or relative filename / upload id, or 'it'/'latest' for latest upload)"},
             "prompt": {"type": "string", "description": PROMPT_HELP},
+            "output_dir": {"type": "string", "description": "Optional: directory where output is saved (default ~/Downloads/odysseus-decensor)"},
             "regions": {"type": "string", "description": "Optional: your own areas as 'x,y,w,h;x,y,w,h' (skips detection)"},
             "mask_path": {"type": "string", "description": "Optional: mask image, white = fill in (skips detection)"},
-            "kinds": {"type": "string", "description": "What to detect: mosaic, bars or 'mosaic,bars' (default both)"},
-            "model": {"type": "string", "description": "Model to use: 'anime' (default, specialized for manga/anime) or 'general' (SDXL photorealistic)"},
+            "kinds": {"type": "string", "description": "What to detect: mosaic, bars, spots or comma-separated combination (default 'mosaic,bars,spots')"},
+            "model": {"type": "string", "description": "Model to use: 'er0manga' (default, fastest ~0.3s high-quality anime inpainting), 'hybrid', 'anime' (Animagine XL SDXL), or 'general' (SDXL photorealistic)"},
             "style": {"type": "string", "description": "Style prompt preset: 'auto' (default), 'anime' or 'general'"},
             "anatomy": {"type": "string", "description": "Anatomy prompt preset: 'auto' (default, auto-detects male vs female), 'female', 'male', or 'none'"},
             "steps": {"type": "integer", "description": "Quality vs speed, 15-50 (default 30)"},
@@ -76,12 +79,13 @@ TOOLS = [
     Tool(
         name="uncensor_folder",
         description="Decensor every manga panel / image in a folder (chapter, directory, or game pictures folder). Automatically "
-                    "detects images with censorship, inpaints them, and saves to ~/Pictures/odysseus-uncensor. "
+                    "detects images with censorship, inpaints them, and saves to ~/Downloads/odysseus-decensor (or specified output_dir). "
                     "Runs in the background and returns a job id; check progress with uncensor_job_status.",
         inputSchema={"type": "object", "properties": {
             "folder": {"type": "string", "description": "Full path of the folder of images / manga panels"},
             "prompt": {"type": "string", "description": PROMPT_HELP},
-            "model": {"type": "string", "description": "Model to use: 'anime' (default, specialized for manga/anime) or 'general' (SDXL photorealistic)"},
+            "output_dir": {"type": "string", "description": "Optional: directory where output is saved (default ~/Downloads/odysseus-decensor)"},
+            "model": {"type": "string", "description": "Model to use: 'er0manga' (default), 'hybrid', 'anime' or 'general'"},
             "style": {"type": "string", "description": "Style prompt preset: 'auto' (default), 'anime' or 'general'"},
             "anatomy": {"type": "string", "description": "Anatomy prompt preset: 'auto' (default), 'female', 'male', or 'none'"},
             "steps": {"type": "integer", "description": "Quality vs speed, 15-50 (default 30)"},
@@ -89,11 +93,12 @@ TOOLS = [
     ),
     Tool(
         name="decensor_folder",
-        description="Alias for uncensor_folder: Decensor every manga panel / image in a folder.",
+        description="Alias for uncensor_folder: Decensor every manga panel / image in a folder. Saves to ~/Downloads/odysseus-decensor.",
         inputSchema={"type": "object", "properties": {
             "folder": {"type": "string", "description": "Full path of the folder of images / manga panels"},
             "prompt": {"type": "string", "description": PROMPT_HELP},
-            "model": {"type": "string", "description": "Model to use: 'anime' (default, specialized for manga/anime) or 'general' (SDXL photorealistic)"},
+            "output_dir": {"type": "string", "description": "Optional: directory where output is saved (default ~/Downloads/odysseus-decensor)"},
+            "model": {"type": "string", "description": "Model to use: 'er0manga' (default), 'hybrid', 'anime' or 'general'"},
             "style": {"type": "string", "description": "Style prompt preset: 'auto' (default), 'anime' or 'general'"},
             "anatomy": {"type": "string", "description": "Anatomy prompt preset: 'auto' (default), 'female', 'male', or 'none'"},
             "steps": {"type": "integer", "description": "Quality vs speed, 15-50 (default 30)"},
@@ -113,26 +118,28 @@ TOOLS = [
 
 
 def _kinds(arguments: dict) -> tuple[str, ...]:
-    parts = tuple(k.strip() for k in str(arguments.get("kinds") or "mosaic,bars").split(",") if k.strip() in ("mosaic", "bars"))
-    return parts or ("mosaic", "bars")
+    allowed = {"mosaic", "bars", "spots", "white", "black"}
+    parts = tuple(k.strip() for k in str(arguments.get("kinds") or "mosaic,bars,spots").split(",") if k.strip() in allowed)
+    return parts or ("mosaic", "bars", "spots")
 
 
 def _steps(arguments: dict) -> int:
     return max(10, min(int(arguments.get("steps") or 30), 60))
 
 
-def _run_folder(job_id: str, folder: Path, prompt: str, steps: int, model: str = "anime", style: str = "auto", anatomy: str = "auto") -> None:
+def _run_folder(job_id: str, folder: Path, prompt: str, steps: int, model: str = "er0manga", style: str = "auto", anatomy: str = "auto", out_dir: Path | None = None) -> None:
     job = JOBS[job_id]
-    out_dir = pl.OUT_DIR / folder.name
+    target_out = (out_dir or pl.OUT_DIR) / folder.name
+    target_out.mkdir(parents=True, exist_ok=True)
     for i, path in enumerate(job["pages"], 1):
         job["current"] = path.name
         try:
             if path.suffix.lower() in pl.VIDEO_EXTS:
-                res = pl.uncensor_video(path, inpainter, out_dir=out_dir, prompt=prompt, steps=steps, model=model, style=style, anatomy=anatomy)
+                res = pl.uncensor_video(path, inpainter, out_dir=target_out, prompt=prompt, steps=steps, model=model, style=style, anatomy=anatomy)
                 job["results"].append(f"{path.name}: {res['output']} ({res.get('censored_frames', 0)} frames, {res.get('seconds', 0)}s)")
                 job["uncensored_count"] = job.get("uncensored_count", 0) + 1
             else:
-                res = pl.uncensor(path, inpainter, out_dir=out_dir, prompt=prompt, steps=steps, model=model, style=style, anatomy=anatomy)
+                res = pl.uncensor(path, inpainter, out_dir=target_out, prompt=prompt, steps=steps, model=model, style=style, anatomy=anatomy)
                 if res.get("output"):
                     job["results"].append(f"{path.name}: {res['output']} ({len(res.get('regions', []))} regions, {res.get('seconds', 0)}s)")
                     job["uncensored_count"] = job.get("uncensored_count", 0) + 1
@@ -147,21 +154,24 @@ def _run_folder(job_id: str, folder: Path, prompt: str, steps: int, model: str =
 
 
 def _handle(name: str, arguments: dict) -> str:
+    output_dir = Path(arguments["output_dir"]).expanduser() if arguments.get("output_dir") else pl.OUT_DIR
+    model_choice = str(arguments.get("model") or "er0manga")
+
     if name == "find_censored_regions":
         path = pl.check_image_path(arguments.get("image_path", ""))
         rgb, regions, mask = pl.find_regions(path, _kinds(arguments))
         if not regions:
             return "No mosaic or black bars found. If something is covered, give the area yourself as regions='x,y,w,h'."
-        preview = pl.write_preview(path, rgb, regions, mask)
+        preview = pl.write_preview(path, rgb, regions, mask, out_dir=output_dir)
         return "\n".join(pl.describe(regions) + [f"preview: {preview}"])
 
     if name in ("uncensor_image", "decensor_image"):
         path = pl.check_image_path(arguments.get("image_path", ""))
         if path.suffix.lower() in pl.VIDEO_EXTS:
             res = pl.uncensor_video(
-                path, inpainter, prompt=str(arguments.get("prompt") or ""),
+                path, inpainter, out_dir=output_dir, prompt=str(arguments.get("prompt") or ""),
                 steps=_steps(arguments),
-                model=str(arguments.get("model") or "anime"),
+                model=model_choice,
                 style=str(arguments.get("style") or "auto"),
                 anatomy=str(arguments.get("anatomy") or "auto"),
             )
@@ -169,12 +179,12 @@ def _handle(name: str, arguments: dict) -> str:
 
         mask = arguments.get("mask_path")
         res = pl.uncensor(
-            path, inpainter, kinds=_kinds(arguments),
+            path, inpainter, out_dir=output_dir, kinds=_kinds(arguments),
             boxes=pl.parse_boxes(arguments["regions"]) if arguments.get("regions") else None,
             mask_path=pl.check_image_path(mask) if mask else None,
             prompt=str(arguments.get("prompt") or ""), steps=_steps(arguments),
             seed=int(arguments["seed"]) if arguments.get("seed") is not None else None,
-            model=str(arguments.get("model") or "anime"),
+            model=model_choice,
             style=str(arguments.get("style") or "auto"),
             anatomy=str(arguments.get("anatomy") or "auto"),
         )
@@ -193,10 +203,10 @@ def _handle(name: str, arguments: dict) -> str:
         job_id = uuid.uuid4().hex[:8]
         JOBS[job_id] = {"state": "running", "pages": pages, "done": 0, "current": "", "results": [], "started_at": time.time(), "uncensored_count": 0, "skipped_count": 0}
         threading.Thread(target=_run_folder, args=(job_id, folder, str(arguments.get("prompt") or ""), _steps(arguments),
-                                                  str(arguments.get("model") or "anime"), str(arguments.get("style") or "auto"),
-                                                  str(arguments.get("anatomy") or "auto")),
+                                                  model_choice, str(arguments.get("style") or "auto"),
+                                                  str(arguments.get("anatomy") or "auto"), output_dir),
                          daemon=True).start()
-        return f"job {job_id} started: {len(pages)} pages, results go to {pl.OUT_DIR / folder.name}"
+        return f"job {job_id} started: {len(pages)} pages, results go to {output_dir / folder.name}"
 
     if name == "uncensor_job_status":
         job = JOBS.get(str(arguments.get("job_id", "")))
