@@ -18,9 +18,14 @@ import numpy as np
 
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 LAMA_MODEL = MODELS_DIR / "anime-manga-big-lama.pt"
+ER0MANGA_DIR = MODELS_DIR / "Er0mangaInpaint"
 ANIME_MODEL = MODELS_DIR / "animagine-xl-inpainting"
 GENERAL_MODEL = MODELS_DIR / "sdxl-inpainting"
-DEFAULT_MODEL = LAMA_MODEL if LAMA_MODEL.exists() else (ANIME_MODEL if (ANIME_MODEL / "model_index.json").exists() else GENERAL_MODEL)
+DEFAULT_MODEL = ER0MANGA_DIR if (ER0MANGA_DIR / "pretrained/00-30-09/models/best.ckpt").exists() else (
+    LAMA_MODEL if LAMA_MODEL.exists() else (
+        ANIME_MODEL if (ANIME_MODEL / "model_index.json").exists() else GENERAL_MODEL
+    )
+)
 
 POSITIVE_GENERAL = "high quality, detailed, consistent with the surrounding image, matching its style, lighting and colours"
 NEGATIVE_GENERAL = "mosaic, pixelated, blocky, censored, censor bar, blur, low quality, jpeg artifacts, watermark, text"
@@ -38,18 +43,18 @@ def resolve_model_dir(model: str | Path | None = None) -> Path:
         env = os.environ.get("UNCENSOR_MODEL_DIR") or os.environ.get("UNCENSOR_MODEL")
         if env:
             return Path(env)
-        if LAMA_MODEL.exists():
-            return LAMA_MODEL
-        if (ANIME_MODEL / "model_index.json").exists():
-            return ANIME_MODEL
-        return GENERAL_MODEL
+        return DEFAULT_MODEL
 
     if isinstance(model, str):
         low = model.strip().lower()
-        if low in ("lama", "manga", "anime-manga", "fast", "er0manga"):
+        if low in ("er0manga", "eromanga", "c", "option_c", "manga-adult"):
+            return ER0MANGA_DIR
+        if low in ("hybrid", "two-stage", "b", "option_b"):
+            return Path("hybrid")
+        if low in ("lama", "manga", "anime-manga", "fast"):
             return LAMA_MODEL
-        if low in ("anime", "animagine"):
-            return LAMA_MODEL if LAMA_MODEL.exists() else ANIME_MODEL
+        if low in ("anime", "animagine", "a", "option_a", "diffusion"):
+            return ANIME_MODEL
         if low in ("general", "sdxl", "realistic"):
             return GENERAL_MODEL
     p = Path(model)
@@ -97,7 +102,15 @@ class Inpainter:
 
     @property
     def is_lama(self) -> bool:
-        return self.model_dir.suffix.lower() == ".pt" or "lama" in str(self.model_dir).lower()
+        return (self.model_dir.suffix.lower() == ".pt" or "lama" in str(self.model_dir).lower()) and not self.is_er0manga
+
+    @property
+    def is_er0manga(self) -> bool:
+        return "er0manga" in str(self.model_dir).lower()
+
+    @property
+    def is_hybrid(self) -> bool:
+        return "hybrid" in str(self.model_dir).lower()
 
     @property
     def loaded(self) -> bool:
@@ -118,6 +131,25 @@ class Inpainter:
 
     def _load(self):
         import torch
+        if self.is_er0manga:
+            import sys
+            import yaml
+            from omegaconf import OmegaConf
+            if str(ER0MANGA_DIR) not in sys.path:
+                sys.path.insert(0, str(ER0MANGA_DIR))
+            from saicinpainting.training.modules import make_generator
+            cfg_path = ER0MANGA_DIR / "pretrained/00-30-09/config.yaml"
+            with open(cfg_path) as f:
+                cfg = OmegaConf.create(yaml.safe_load(f))
+            gen = make_generator(cfg, **cfg.generator)
+            ckpt_path = ER0MANGA_DIR / "pretrained/00-30-09/models/best.ckpt"
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            gen_sd = {k.replace("generator.", ""): v for k, v in ckpt["state_dict"].items() if k.startswith("generator.")}
+            gen.load_state_dict(gen_sd, strict=True)
+            device = "mps" if torch.backends.mps.is_available() else "cpu"
+            gen.to(device).eval()
+            return gen
+
         if self.is_lama:
             if not self.model_dir.exists():
                 raise FileNotFoundError(f"LaMa model not found at {self.model_dir}")
@@ -128,12 +160,13 @@ class Inpainter:
 
         from diffusers import StableDiffusionXLInpaintPipeline
 
-        if not (self.model_dir / "model_index.json").exists():
-            raise FileNotFoundError(f"model not found in {self.model_dir}; run download script")
+        pipe_dir = ANIME_MODEL if self.is_hybrid else self.model_dir
+        if not (pipe_dir / "model_index.json").exists():
+            raise FileNotFoundError(f"model not found in {pipe_dir}; run download script")
         on_gpu = torch.backends.mps.is_available()
-        has_fp16 = bool(list(self.model_dir.glob("unet/*.fp16.safetensors")))
+        has_fp16 = bool(list(pipe_dir.glob("unet/*.fp16.safetensors")))
         pipe = StableDiffusionXLInpaintPipeline.from_pretrained(
-            self.model_dir,
+            pipe_dir,
             torch_dtype=torch.float16 if on_gpu else torch.float32,
             variant="fp16" if (on_gpu and has_fp16) else None,
             use_safetensors=True,
@@ -164,6 +197,37 @@ class Inpainter:
         if (self._pipe is not None or self._model is not None) and not self.busy and time.time() - self._last_used > self.idle_seconds:
             return self.unload()
         return False
+
+    def _inpaint_er0manga(self, image: np.ndarray, mask: np.ndarray, feather: float = 3.0) -> np.ndarray:
+        import torch
+        import torch.nn.functional as F
+
+        h, w = image.shape[:2]
+        pad_h = (8 - h % 8) % 8
+        pad_w = (8 - w % 8) % 8
+
+        img_t = torch.from_numpy(image.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
+        mask_t = torch.from_numpy((mask > 0).astype(np.float32)).unsqueeze(0).unsqueeze(0)
+
+        if pad_h > 0 or pad_w > 0:
+            img_t = F.pad(img_t, (0, pad_w, 0, pad_h), mode="reflect")
+            mask_t = F.pad(mask_t, (0, pad_w, 0, pad_h), mode="replicate")
+
+        masked_img = img_t * (1.0 - mask_t)
+        inp_4ch = torch.cat([masked_img, mask_t], dim=1)
+
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
+        with torch.no_grad():
+            out_t = self._model(inp_4ch.to(device))
+
+        out_np = out_t.squeeze(0).permute(1, 2, 0).cpu().numpy()
+        if pad_h > 0 or pad_w > 0:
+            out_np = out_np[:h, :w]
+        out_img = np.clip(out_np * 255.0, 0, 255).astype(np.uint8)
+
+        soft = mask.astype(np.float32) / 255.0
+        alpha = np.maximum(soft, cv2.GaussianBlur(soft, (0, 0), feather))[..., None]
+        return (out_img.astype(np.float32) * alpha + image.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
 
     def _inpaint_lama(self, image: np.ndarray, mask: np.ndarray, feather: float = 3.0) -> np.ndarray:
         import torch
@@ -208,6 +272,15 @@ class Inpainter:
             if model is not None:
                 self.set_model(model)
 
+            if self.is_er0manga:
+                if self._model is None:
+                    say("loading Er0manga adult manga inpainting model...")
+                    self._model = self._load()
+                say(f"inpainting with Er0manga ({image.shape[1]}x{image.shape[0]})")
+                result = self._inpaint_er0manga(image, mask, feather=feather)
+                self._last_used = time.time()
+                return result
+
             if self.is_lama:
                 if self._model is None:
                     say(f"loading fast manga inpainting model: {self.model_dir.name}")
@@ -217,18 +290,43 @@ class Inpainter:
                 self._last_used = time.time()
                 return result
 
+            base_img = image
+            if self.is_hybrid:
+                say("running hybrid stage 1 (fast base)...")
+                device = "mps" if torch.backends.mps.is_available() else "cpu"
+                lama = torch.jit.load(str(LAMA_MODEL), map_location=device).eval()
+                h, w = image.shape[:2]
+                pad_h, pad_w = (8 - h % 8) % 8, (8 - w % 8) % 8
+                img_t = torch.from_numpy(image.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
+                mask_t = torch.from_numpy((mask > 0).astype(np.float32)).unsqueeze(0).unsqueeze(0)
+                if pad_h > 0 or pad_w > 0:
+                    img_t = F.pad(img_t, (0, pad_w, 0, pad_h), mode="reflect")
+                    mask_t = F.pad(mask_t, (0, pad_w, 0, pad_h), mode="replicate")
+                img_t = img_t * (1.0 - mask_t)
+                with torch.no_grad():
+                    out_t = lama(img_t.to(device), mask_t.to(device))
+                out_np = out_t.squeeze(0).permute(1, 2, 0).cpu().numpy()
+                if pad_h > 0 or pad_w > 0:
+                    out_np = out_np[:h, :w]
+                base_clean = np.clip(out_np * 255.0, 0, 255).astype(np.uint8)
+                soft = mask.astype(np.float32) / 255.0
+                alpha = np.maximum(soft, cv2.GaussianBlur(soft, (0, 0), feather))[..., None]
+                base_img = (base_clean.astype(np.float32) * alpha + image.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
+                del lama
+                if device == "mps":
+                    torch.mps.empty_cache()
+                strength = min(strength, 0.60)
+                steps = min(steps, 20)
+
             if self._pipe is None:
-                say(f"loading inpainting model: {self.model_dir.name}")
+                say(f"loading diffusion inpainting model: {self.model_dir.name}")
                 self._pipe = self._load()
 
-            is_anime = (style.lower() in ("anime", "manga")) or (
-                style.lower() == "auto" and any(k in str(self.model_dir).lower() for k in ("anime", "animagine", "manga"))
-            )
-            base_neg = NEGATIVE_ANIME if is_anime else NEGATIVE_GENERAL
+            is_anime = True
+            base_neg = NEGATIVE_ANIME
             full_negative = f"{negative}, {base_neg}" if negative else base_neg
 
-            # Pre-demosaic the masked area to remove blocky grid lattice frequencies from the latent base
-            demosaiced = cv2.inpaint(image, mask, 5, cv2.INPAINT_TELEA) if mask.any() else image
+            demosaiced = cv2.inpaint(base_img, mask, 5, cv2.INPAINT_TELEA) if mask.any() else base_img
             result = image.copy()
             parts = components(mask)
             for n, (bbox, part) in enumerate(parts, 1):
