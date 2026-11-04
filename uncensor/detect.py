@@ -53,7 +53,8 @@ def _lattice(profile: np.ndarray, tile: int, lo: int, hi: int, share_min: float,
         count = (n - p + b - 1) // b
         valid = np.arange(lines.shape[1])[None, :] < count[:, None]
         occ = ((lines > 0.2 * tile) & valid).sum(axis=1) / np.maximum(count, 1)
-        ok = (share >= share_min) & (occ >= occ_min) & (count >= 3) & (total >= tile)
+        req_share = np.where(b < 6, share_min, min(share_min, 0.72))
+        ok = (share >= req_share) & (occ >= occ_min) & (count >= 3) & (total >= tile)
         score = np.where(ok, share * occ, 0)
         better = score > best_score
         best_score = np.where(better, score, best_score)
@@ -183,7 +184,7 @@ def _refine(rgb: np.ndarray, b: int, gx: int, gy: int, tiles: list[tuple[int, in
         merged_mask |= (labels == sc)
 
     # For clean/lossless sources, expand to adjacent components on same lattice across highlights/splashes
-    if flat_tol <= 2.2:
+    if flat_tol <= 4.0:
         for k in range(1, count):
             if k in seed_comps:
                 continue

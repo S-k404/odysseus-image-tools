@@ -17,9 +17,10 @@ import cv2
 import numpy as np
 
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
+LAMA_MODEL = MODELS_DIR / "anime-manga-big-lama.pt"
 ANIME_MODEL = MODELS_DIR / "animagine-xl-inpainting"
 GENERAL_MODEL = MODELS_DIR / "sdxl-inpainting"
-DEFAULT_MODEL = ANIME_MODEL if (ANIME_MODEL / "model_index.json").exists() else GENERAL_MODEL
+DEFAULT_MODEL = LAMA_MODEL if LAMA_MODEL.exists() else (ANIME_MODEL if (ANIME_MODEL / "model_index.json").exists() else GENERAL_MODEL)
 
 POSITIVE_GENERAL = "high quality, detailed, consistent with the surrounding image, matching its style, lighting and colours"
 NEGATIVE_GENERAL = "mosaic, pixelated, blocky, censored, censor bar, blur, low quality, jpeg artifacts, watermark, text"
@@ -34,17 +35,21 @@ NATIVE = 1024  # SDXL's trained size: the long side of every crop is scaled to t
 
 def resolve_model_dir(model: str | Path | None = None) -> Path:
     if model is None:
-        env = os.environ.get("UNCENSOR_MODEL_DIR")
+        env = os.environ.get("UNCENSOR_MODEL_DIR") or os.environ.get("UNCENSOR_MODEL")
         if env:
             return Path(env)
+        if LAMA_MODEL.exists():
+            return LAMA_MODEL
         if (ANIME_MODEL / "model_index.json").exists():
             return ANIME_MODEL
         return GENERAL_MODEL
 
     if isinstance(model, str):
         low = model.strip().lower()
-        if low in ("anime", "manga", "animagine"):
-            return ANIME_MODEL
+        if low in ("lama", "manga", "anime-manga", "fast", "er0manga"):
+            return LAMA_MODEL
+        if low in ("anime", "animagine"):
+            return LAMA_MODEL if LAMA_MODEL.exists() else ANIME_MODEL
         if low in ("general", "sdxl", "realistic"):
             return GENERAL_MODEL
     p = Path(model)
@@ -86,12 +91,17 @@ class Inpainter:
         self.model_dir = resolve_model_dir(model_dir)
         self.idle_seconds = idle_seconds
         self._pipe = None
+        self._model = None
         self._lock = threading.RLock()
         self._last_used = 0.0
 
     @property
+    def is_lama(self) -> bool:
+        return self.model_dir.suffix.lower() == ".pt" or "lama" in str(self.model_dir).lower()
+
+    @property
     def loaded(self) -> bool:
-        return self._pipe is not None
+        return self._pipe is not None or self._model is not None
 
     @property
     def busy(self) -> bool:
@@ -108,6 +118,14 @@ class Inpainter:
 
     def _load(self):
         import torch
+        if self.is_lama:
+            if not self.model_dir.exists():
+                raise FileNotFoundError(f"LaMa model not found at {self.model_dir}")
+            device = "mps" if torch.backends.mps.is_available() else "cpu"
+            model = torch.jit.load(str(self.model_dir), map_location=device)
+            model.eval()
+            return model
+
         from diffusers import StableDiffusionXLInpaintPipeline
 
         if not (self.model_dir / "model_index.json").exists():
@@ -126,21 +144,56 @@ class Inpainter:
 
     def unload(self) -> bool:
         with self._lock:
-            if self._pipe is None:
-                return False
-            self._pipe = None
-            gc.collect()
-            try:
-                import torch
-                torch.mps.empty_cache()
-            except Exception:
-                pass
-            return True
+            unloaded = False
+            if self._pipe is not None:
+                self._pipe = None
+                unloaded = True
+            if self._model is not None:
+                self._model = None
+                unloaded = True
+            if unloaded:
+                gc.collect()
+                try:
+                    import torch
+                    torch.mps.empty_cache()
+                except Exception:
+                    pass
+            return unloaded
 
     def unload_if_idle(self) -> bool:
-        if self._pipe is not None and not self.busy and time.time() - self._last_used > self.idle_seconds:
+        if (self._pipe is not None or self._model is not None) and not self.busy and time.time() - self._last_used > self.idle_seconds:
             return self.unload()
         return False
+
+    def _inpaint_lama(self, image: np.ndarray, mask: np.ndarray, feather: float = 3.0) -> np.ndarray:
+        import torch
+        import torch.nn.functional as F
+
+        h, w = image.shape[:2]
+        pad_h = (8 - h % 8) % 8
+        pad_w = (8 - w % 8) % 8
+
+        img_t = torch.from_numpy(image.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
+        mask_t = torch.from_numpy((mask > 0).astype(np.float32)).unsqueeze(0).unsqueeze(0)
+
+        if pad_h > 0 or pad_w > 0:
+            img_t = F.pad(img_t, (0, pad_w, 0, pad_h), mode="reflect")
+            mask_t = F.pad(mask_t, (0, pad_w, 0, pad_h), mode="replicate")
+
+        img_t = img_t * (1.0 - mask_t)
+
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
+        with torch.no_grad():
+            out_t = self._model(img_t.to(device), mask_t.to(device))
+
+        out_np = out_t.squeeze(0).permute(1, 2, 0).cpu().numpy()
+        if pad_h > 0 or pad_w > 0:
+            out_np = out_np[:h, :w]
+        out_img = np.clip(out_np * 255.0, 0, 255).astype(np.uint8)
+
+        soft = mask.astype(np.float32) / 255.0
+        alpha = np.maximum(soft, cv2.GaussianBlur(soft, (0, 0), feather))[..., None]
+        return (out_img.astype(np.float32) * alpha + image.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
 
     def inpaint(self, image: np.ndarray, mask: np.ndarray, prompt: str = "", negative: str = "", steps: int = 30,
                 guidance: float = 7.5, strength: float = 0.99, seed: int | None = None, feather: float = 3.0,
@@ -154,6 +207,16 @@ class Inpainter:
         with self._lock:
             if model is not None:
                 self.set_model(model)
+
+            if self.is_lama:
+                if self._model is None:
+                    say(f"loading fast manga inpainting model: {self.model_dir.name}")
+                    self._model = self._load()
+                say(f"inpainting with anime-manga LaMa ({image.shape[1]}x{image.shape[0]})")
+                result = self._inpaint_lama(image, mask, feather=feather)
+                self._last_used = time.time()
+                return result
+
             if self._pipe is None:
                 say(f"loading inpainting model: {self.model_dir.name}")
                 self._pipe = self._load()

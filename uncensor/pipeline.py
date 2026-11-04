@@ -100,7 +100,7 @@ VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm"}
 def uncensor(path: Path, inpainter: Inpainter, *, out_dir: Path = OUT_DIR, kinds=("mosaic", "bars"), boxes=None,
              mask_path: Path | None = None, prompt: str = "", negative: str = "", steps: int = 30,
              guidance: float = 7.5, strength: float = 0.99, grow: int | None = None, seed: int | None = None,
-             max_regions: int = 12, model: str | Path | None = None, style: str = "auto", anatomy: str = "auto",
+             max_regions: int = 48, model: str | Path | None = None, style: str = "auto", anatomy: str = "auto",
              progress: Callable[[str], None] | None = None) -> dict:
     """Detect (or take) the censored regions, inpaint them, write `<stem>_uncensored.png`. The original is untouched."""
     started = time.time()
