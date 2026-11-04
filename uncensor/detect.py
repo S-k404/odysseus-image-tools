@@ -45,7 +45,10 @@ def _lattice(profile: np.ndarray, tile: int, lo: int, hi: int, share_min: float,
         m = np.pad(profile, ((0, 0), (0, pad))).reshape(nt, -1, b)
         sums = m.sum(axis=1)
         p = sums.argmax(axis=1)
-        share = sums[rows, p] / np.maximum(total, 1)
+        p_prev = (p - 1) % b
+        p_next = (p + 1) % b
+        adj = np.maximum(sums[rows, p_prev], sums[rows, p_next])
+        share = (sums[rows, p] + adj) / np.maximum(total, 1)
         lines = m[rows, :, p]  # (nt, cycles)
         count = (n - p + b - 1) // b
         valid = np.arange(lines.shape[1])[None, :] < count[:, None]
@@ -59,7 +62,8 @@ def _lattice(profile: np.ndarray, tile: int, lo: int, hi: int, share_min: float,
     return best_b, best_p, best_score > 0
 
 
-def _tile_hits(ex: np.ndarray, ey: np.ndarray, tile: int, lo: int, hi: int):
+def _tile_hits(ex: np.ndarray, ey: np.ndarray, tile: int, lo: int, hi: int,
+               share_min: float = 0.80, occ_min: float = 0.45):
     """Tiles whose horizontal and vertical edges both sit on one block lattice: (y0, x0, b, gx, gy)."""
     h, w = ex.shape[0], ey.shape[1]
     stride = tile // 2
@@ -77,8 +81,8 @@ def _tile_hits(ex: np.ndarray, ey: np.ndarray, tile: int, lo: int, hi: int):
         for ix, x0 in enumerate(xs):
             cx[iy, ix] = rows[x0:x0 + n]
             cy[iy, ix] = csy[y0:y0 + n, x0 + tile] - csy[y0:y0 + n, x0]
-    bx, px, okx = _lattice(cx.reshape(-1, n), tile, lo, hi, 0.9, 0.6)
-    by, py, oky = _lattice(cy.reshape(-1, n), tile, lo, hi, 0.9, 0.6)
+    bx, px, okx = _lattice(cx.reshape(-1, n), tile, lo, hi, share_min, occ_min)
+    by, py, oky = _lattice(cy.reshape(-1, n), tile, lo, hi, share_min, occ_min)
     hits = []
     for k in np.flatnonzero(okx & oky & (bx == by)):
         iy, ix = divmod(int(k), len(xs))
@@ -89,12 +93,12 @@ def _tile_hits(ex: np.ndarray, ey: np.ndarray, tile: int, lo: int, hi: int):
 
 
 def detect_mosaic(rgb: np.ndarray, min_block: int = 4, max_block: int = 32, tols: tuple[int, ...] = (3, 8),
-                  min_blocks: int = 6):
+                  min_blocks: int = 4):
     """Returns (regions, mask). `tols` are the colour steps that count as an edge: a strict one for lossless
     images and a lenient one for JPEG noise. The mask is the union of the mosaic blocks."""
     h, w = rgb.shape[:2]
     mask = np.zeros((h, w), np.uint8)
-    if min(h, w) < 48:
+    if min(h, w) < 32:
         return [], mask
     img = rgb.astype(np.int16)
     step_x = np.abs(np.diff(img, axis=1)).max(axis=2)
@@ -103,11 +107,11 @@ def detect_mosaic(rgb: np.ndarray, min_block: int = 4, max_block: int = 32, tols
     clusters: dict[tuple[int, int, int], set[tuple[int, int, int]]] = {}
     for tol in tols:
         ex, ey = step_x > tol, step_y > tol
-        for tile in (48, 96):
-            hi = min(max_block, tile // 3)
+        for tile in (32, 48, 96):
+            hi = min(max_block, tile // 2)
             if hi < min_block:
                 continue
-            for y0, x0, b, gx, gy in _tile_hits(ex, ey, tile, min_block, hi):
+            for y0, x0, b, gx, gy in _tile_hits(ex, ey, tile, min_block, hi, share_min=0.80, occ_min=0.45):
                 clusters.setdefault((b, gx, gy), set()).add((y0, x0, tile))
 
     regions: list[Region] = []
@@ -121,7 +125,7 @@ def detect_mosaic(rgb: np.ndarray, min_block: int = 4, max_block: int = 32, tols
 def _refine(rgb: np.ndarray, b: int, gx: int, gy: int, tiles: list[tuple[int, int, int]], min_blocks: int):
     """Block-level pass for one lattice: flood out from the seed tiles over flat, varying blocks."""
     h, w = rgb.shape[:2]
-    reach = lambda t: t + b  # how far past the seed tiles the flood below may run
+    reach = lambda t: max(t * 3, 200)  # generous search window around confirmed seed tiles
     rx0 = max(min(x - reach(t) for _, x, t in tiles), 0)
     ry0 = max(min(y - reach(t) for y, _, t in tiles), 0)
     rx1 = min(max(x + t + reach(t) for _, x, t in tiles), w)
@@ -140,43 +144,67 @@ def _refine(rgb: np.ndarray, b: int, gx: int, gy: int, tiles: list[tuple[int, in
     for y0, x0, t in tiles:
         seed[max(-(-(y0 - sy) // b), 0):max((y0 + t - sy) // b, 0),
              max(-(-(x0 - sx) // b), 0):max((x0 + t - sx) // b, 0)] = True
-        r = t // 2 + b
+        r = t // 3 + b // 2
         near[max((y0 - r - sy) // b, 0):max((y0 + t + r - sy) // b + 1, 0),
              max((x0 - r - sx) // b, 0):max((x0 + t + r - sx) // b + 1, 0)] = True
     if not seed.any():
         return []
-    # How flat a block must be comes from the blocks already confirmed: ~0 when lossless, a few levels for JPEG.
-    flat_tol = float(np.clip(2 * np.median(dev[seed]) + 0.5, 0.5, 14.0))
+
+    # Calibrated flat tolerance based on median dev of confirmed seed blocks
+    flat_tol = float(np.clip(2.0 * np.median(dev[seed]) + 0.75, 0.75, 14.0))
     cand = dev <= flat_tol
-    if flat_tol > 2:  # lossy source: the tolerance also admits smooth gradients, so do not let the flood run far
+    if flat_tol > 2.2:  # lossy source: the tolerance also admits smooth gradients, so do not let the flood run far
         cand &= near
 
     # A mosaic block differs from at least one neighbouring block; plain background does not.
-    varies = np.zeros_like(cand)
     vary_tol = max(0.5, flat_tol)
     dx = np.abs(mean[:, 1:] - mean[:, :-1]).max(axis=2) > vary_tol
     dy = np.abs(mean[1:] - mean[:-1]).max(axis=2) > vary_tol
-    pair_x = dx & cand[:, 1:] & cand[:, :-1]
-    pair_y = dy & cand[1:] & cand[:-1]
-    varies[:, 1:] |= pair_x
-    varies[:, :-1] |= pair_x
-    varies[1:] |= pair_y
-    varies[:-1] |= pair_y
+    varies = np.zeros_like(cand)
+    varies[:, 1:] |= (dx & cand[:, 1:] & cand[:, :-1])
+    varies[:, :-1] |= (dx & cand[:, 1:] & cand[:, :-1])
+    varies[1:] |= (dy & cand[1:] & cand[:-1])
+    varies[:-1] |= (dy & cand[1:] & cand[:-1])
     core = cv2.morphologyEx(varies.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
     grid = (core.astype(bool) & cand).astype(np.uint8)
 
-    out = []
     count, labels, stats, _ = cv2.connectedComponentsWithStats(grid, connectivity=4)
+    seed_comps = []
     for k in range(1, count):
-        if stats[k, cv2.CC_STAT_AREA] < min_blocks:
-            continue
         comp = labels == k
-        if not (comp & seed).any() or varies[comp].mean() < 0.3:  # must grow from a confirmed lattice tile
-            continue
-        x, y, bw, bh = (int(v) for v in stats[k, :4])
-        piece = np.kron(comp[y:y + bh, x:x + bw], np.ones((b, b), bool))
-        out.append((Region(sx + x * b, sy + y * b, bw * b, bh * b, "mosaic", b), piece, (sx + x * b, sy + y * b)))
-    return out
+        if (comp & seed).any() and stats[k, cv2.CC_STAT_AREA] >= min_blocks and varies[comp].mean() >= 0.25:
+            seed_comps.append(k)
+
+    if not seed_comps:
+        return []
+
+    merged_mask = np.zeros((nby, nbx), bool)
+    for sc in seed_comps:
+        merged_mask |= (labels == sc)
+
+    # For clean/lossless sources, expand to adjacent components on same lattice across highlights/splashes
+    if flat_tol <= 2.2:
+        for k in range(1, count):
+            if k in seed_comps:
+                continue
+            comp = labels == k
+            if stats[k, cv2.CC_STAT_AREA] < min_blocks or varies[comp].mean() < 0.25:
+                continue
+            dist = cv2.dilate(comp.astype(np.uint8), np.ones((5, 5), np.uint8))
+            if (dist & merged_mask).any():
+                merged_mask |= comp
+
+    # Emit the component pieces
+    y_idx, x_idx = np.where(merged_mask)
+    if len(y_idx) == 0:
+        return []
+    bx0, by0 = int(x_idx.min()), int(y_idx.min())
+    bx1, by1 = int(x_idx.max()) + 1, int(y_idx.max()) + 1
+    bw, bh = bx1 - bx0, by1 - by0
+    sub_comp = merged_mask[by0:by1, bx0:bx1]
+    piece = np.kron(sub_comp, np.ones((b, b), bool))
+    region = Region(sx + bx0 * b, sy + by0 * b, bw * b, bh * b, "mosaic", b)
+    return [(region, piece, (sx + bx0 * b, sy + by0 * b))]
 
 
 def _merge_regions(regions: list[Region]) -> list[Region]:

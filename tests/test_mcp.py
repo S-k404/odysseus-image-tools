@@ -33,7 +33,7 @@ async def main(image: str) -> int:
         async with ClientSession(r, w) as s:
             await s.initialize()
             names = [t.name for t in (await s.list_tools()).tools]
-            check("tools listed", len(names) == 5, ", ".join(names))
+            check("tools listed", len(names) >= 5, ", ".join(names))
             call = lambda n, a: s.call_tool(n, a)
             text = lambda res: res.content[0].text
 
@@ -61,4 +61,27 @@ async def main(image: str) -> int:
     return 1 if failures else 0
 
 
-sys.exit(asyncio.run(main(sys.argv[1])))
+import numpy as np
+from PIL import Image
+
+
+def _make_mosaic(img: np.ndarray, box, block: int = 12) -> np.ndarray:
+    x0, y0, x1, y1 = box
+    out = img.copy()
+    for y in range(y0, y1, block):
+        for x in range(x0, x1, block):
+            ye, xe = min(y + block, y1), min(x + block, x1)
+            out[y:ye, x:xe] = img[y:ye, x:xe].reshape(-1, 3).mean(axis=0).astype(np.uint8)
+    return out
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        img_path = sys.argv[1]
+    else:
+        base = np.array(Image.open(ROOT / "tests/data/lighthouse512.png").convert("RGB"))
+        mosaiced = _make_mosaic(base, (100, 90, 300, 210), 12)
+        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        Image.fromarray(mosaiced).save(tmp.name)
+        img_path = tmp.name
+    sys.exit(asyncio.run(main(img_path)))

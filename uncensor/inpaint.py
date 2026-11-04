@@ -16,10 +16,41 @@ from typing import Callable
 import cv2
 import numpy as np
 
-DEFAULT_MODEL = Path(__file__).resolve().parent.parent / "models" / "sdxl-inpainting"
-POSITIVE = "high quality, detailed, consistent with the surrounding image, matching its style, lighting and colours"
-NEGATIVE = "mosaic, pixelated, blocky, censored, censor bar, blur, low quality, jpeg artifacts, watermark, text"
+MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
+ANIME_MODEL = MODELS_DIR / "animagine-xl-inpainting"
+GENERAL_MODEL = MODELS_DIR / "sdxl-inpainting"
+DEFAULT_MODEL = ANIME_MODEL if (ANIME_MODEL / "model_index.json").exists() else GENERAL_MODEL
+
+POSITIVE_GENERAL = "high quality, detailed, consistent with the surrounding image, matching its style, lighting and colours"
+NEGATIVE_GENERAL = "mosaic, pixelated, blocky, censored, censor bar, blur, low quality, jpeg artifacts, watermark, text"
+
+POSITIVE_ANIME = "masterpiece, best quality, anime style, manga art, clean lineart, flawless anatomy, perfectly matching surrounding art style and color palette"
+POSITIVE_ANIME_FEMALE = "masterpiece, best quality, anime style, manga art, clean lineart, uncensored, pussy, clitoris, labia, vaginal slit, detailed anatomy, flawless skin"
+POSITIVE_ANIME_MALE = "masterpiece, best quality, anime style, manga art, clean lineart, uncensored, penis, glans, erection, veins, shaft, foreskin, detailed male anatomy"
+NEGATIVE_ANIME = "mosaic, pixelated, blocky, censored, censor bar, blur, low quality, worst quality, jpeg artifacts, realistic, photorealistic, 3d, photo, render, western comic, watermark, text"
+
 NATIVE = 1024  # SDXL's trained size: the long side of every crop is scaled to this
+
+
+def resolve_model_dir(model: str | Path | None = None) -> Path:
+    if model is None:
+        env = os.environ.get("UNCENSOR_MODEL_DIR")
+        if env:
+            return Path(env)
+        if (ANIME_MODEL / "model_index.json").exists():
+            return ANIME_MODEL
+        return GENERAL_MODEL
+
+    if isinstance(model, str):
+        low = model.strip().lower()
+        if low in ("anime", "manga", "animagine"):
+            return ANIME_MODEL
+        if low in ("general", "sdxl", "realistic"):
+            return GENERAL_MODEL
+    p = Path(model)
+    if not p.is_absolute() and (MODELS_DIR / p).exists():
+        return MODELS_DIR / p
+    return p
 
 
 def _round8(v: float) -> int:
@@ -52,7 +83,7 @@ def window_for(bbox, shape, context: float = 0.75, min_side: int = 512):
 
 class Inpainter:
     def __init__(self, model_dir: str | Path | None = None, idle_seconds: float = 300):
-        self.model_dir = Path(os.environ.get("UNCENSOR_MODEL_DIR") or model_dir or DEFAULT_MODEL)
+        self.model_dir = resolve_model_dir(model_dir)
         self.idle_seconds = idle_seconds
         self._pipe = None
         self._lock = threading.RLock()
@@ -69,17 +100,24 @@ class Inpainter:
             return False
         return True
 
+    def set_model(self, model: str | Path | None):
+        target = resolve_model_dir(model)
+        if target != self.model_dir:
+            self.unload()
+            self.model_dir = target
+
     def _load(self):
         import torch
         from diffusers import StableDiffusionXLInpaintPipeline
 
         if not (self.model_dir / "model_index.json").exists():
-            raise FileNotFoundError(f"model not found in {self.model_dir}; run download_models.py")
+            raise FileNotFoundError(f"model not found in {self.model_dir}; run download script")
         on_gpu = torch.backends.mps.is_available()
+        has_fp16 = bool(list(self.model_dir.glob("unet/*.fp16.safetensors")))
         pipe = StableDiffusionXLInpaintPipeline.from_pretrained(
             self.model_dir,
             torch_dtype=torch.float16 if on_gpu else torch.float32,
-            variant="fp16" if on_gpu else None,
+            variant="fp16" if (on_gpu and has_fp16) else None,
             use_safetensors=True,
         )
         pipe.to("mps" if on_gpu else "cpu")
@@ -106,6 +144,7 @@ class Inpainter:
 
     def inpaint(self, image: np.ndarray, mask: np.ndarray, prompt: str = "", negative: str = "", steps: int = 30,
                 guidance: float = 7.5, strength: float = 0.99, seed: int | None = None, feather: float = 3.0,
+                model: str | Path | None = None, style: str = "auto", anatomy: str = "auto",
                 progress: Callable[[str], None] | None = None) -> np.ndarray:
         """image (H, W, 3) uint8 RGB, mask (H, W) uint8 (255 = replace). Returns a new image."""
         import torch
@@ -113,22 +152,54 @@ class Inpainter:
 
         say = progress or (lambda _msg: None)
         with self._lock:
+            if model is not None:
+                self.set_model(model)
             if self._pipe is None:
-                say("loading the inpainting model")
+                say(f"loading inpainting model: {self.model_dir.name}")
                 self._pipe = self._load()
+
+            is_anime = (style.lower() in ("anime", "manga")) or (
+                style.lower() == "auto" and any(k in str(self.model_dir).lower() for k in ("anime", "animagine", "manga"))
+            )
+            base_neg = NEGATIVE_ANIME if is_anime else NEGATIVE_GENERAL
+            full_negative = f"{negative}, {base_neg}" if negative else base_neg
+
+            # Pre-demosaic the masked area to remove blocky grid lattice frequencies from the latent base
+            demosaiced = cv2.inpaint(image, mask, 5, cv2.INPAINT_TELEA) if mask.any() else image
             result = image.copy()
             parts = components(mask)
             for n, (bbox, part) in enumerate(parts, 1):
                 x0, y0, x1, y1 = window_for(bbox, mask.shape)
-                crop = Image.fromarray(result[y0:y1, x0:x1])
+                crop = Image.fromarray(demosaiced[y0:y1, x0:x1])
                 m = Image.fromarray(part[y0:y1, x0:x1])
                 scale = NATIVE / max(crop.width, crop.height)
                 size = (_round8(crop.width * scale), _round8(crop.height * scale))
+
+                # Resolve anime prompt conditioning based on anatomy
+                if is_anime:
+                    anat_mode = anatomy.lower()
+                    if anat_mode == "female":
+                        base_pos = POSITIVE_ANIME_FEMALE
+                    elif anat_mode == "male":
+                        base_pos = POSITIVE_ANIME_MALE
+                    elif anat_mode == "auto":
+                        # Elongated / horizontal or large area -> male; vertical / slit -> female
+                        bw, bh = bbox[2], bbox[3]
+                        if bw > 1.3 * bh or (bw * bh > 12000):
+                            base_pos = POSITIVE_ANIME_MALE
+                        else:
+                            base_pos = POSITIVE_ANIME_FEMALE
+                    else:
+                        base_pos = POSITIVE_ANIME
+                else:
+                    base_pos = POSITIVE_GENERAL
+
+                region_prompt = f"{prompt}, {base_pos}" if prompt else base_pos
                 say(f"region {n}/{len(parts)} at {bbox[0]},{bbox[1]} ({bbox[2]}x{bbox[3]}) -> {size[0]}x{size[1]}")
                 generator = torch.Generator("cpu").manual_seed(seed if seed is not None else int(time.time()) % 2**31)
                 out = self._pipe(
-                    prompt=f"{prompt}, {POSITIVE}" if prompt else POSITIVE,
-                    negative_prompt=f"{negative}, {NEGATIVE}" if negative else NEGATIVE,
+                    prompt=region_prompt,
+                    negative_prompt=full_negative,
                     image=crop.resize(size, Image.LANCZOS),
                     mask_image=m.resize(size, Image.NEAREST),
                     height=size[1], width=size[0],
