@@ -23,10 +23,10 @@ from uncensor.pipeline import load_rgb
 from uncensor.detect import detect_all, grow_mask
 from uncensor.inpaint import Inpainter, window_for, _round8, NATIVE, POSITIVE_ANIME_MALE, NEGATIVE_ANIME
 
-OUT_DIR = Path("~/Pictures/odysseus-uncensor/TEST_COMPARISON")
+OUT_DIR = (Path.home() / "Pictures/odysseus-uncensor/TEST_COMPARISON")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-target_image = Path("~/Documents/TEST/pictures/CG13_01.png_")
+target_image = (Path.home() / "Documents/TEST/pictures/CG13_01.png_")
 print(f"Loading target image: {target_image.name}")
 rgb = load_rgb(target_image)
 regions, raw_mask = detect_all(rgb)

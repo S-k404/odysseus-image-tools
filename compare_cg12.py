@@ -16,9 +16,9 @@ from uncensor.pipeline import load_rgb
 from uncensor.detect import detect_all, grow_mask
 from uncensor.inpaint import Inpainter, NEGATIVE_ANIME
 
-OUT_DIR = Path("~/Pictures/odysseus-uncensor/TEST_COMPARISON")
+OUT_DIR = (Path.home() / "Pictures/odysseus-uncensor/TEST_COMPARISON")
 
-target = Path("~/Documents/TEST/pictures/CG12_03.png_")
+target = (Path.home() / "Documents/TEST/pictures/CG12_03.png_")
 rgb = load_rgb(target)
 regions, raw_mask = detect_all(rgb)
 pad = max([r.block or 8 for r in regions]) // 2 + 4
