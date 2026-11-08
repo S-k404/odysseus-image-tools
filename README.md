@@ -1,3 +1,12 @@
+<!-- datasheet:banner -->
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/banner-dark.svg">
+    <img src=".github/assets/banner-light.svg" alt="Odysseus Image Tools: An MCP server and CLI that finds mosaic and black-bar regions in an image and fills them in with a local inpainting model." width="100%">
+  </picture>
+</p>
+<!-- /datasheet:banner -->
+
 # Odysseus image tools
 
 Two things for the local Odysseus setup (`~/Documents/Docker/Odysseus`), kept out of Odysseus's own folders and its `.venv`:
@@ -5,6 +14,24 @@ Two things for the local Odysseus setup (`~/Documents/Docker/Odysseus`), kept ou
 1. **Image generation** – already wired, nothing in this folder (see below).
 2. **Uncensor** – an MCP server (`uncensor`) that finds mosaic / black-bar censoring in an image and fills it in with a local
    inpainting model. Also a command line tool.
+
+<!-- datasheet:figure -->
+## At a glance
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/diagram-dark.svg">
+    <img src=".github/assets/diagram-light.svg" alt="Block diagram: detect, mask, inpaint, new file" width="100%">
+  </picture>
+</p>
+
+| Characteristic | Detail |
+| --- | --- |
+| **Detection** | Frequency-domain lattice analysis and block-variance profiling; mosaic blocks 4–32 px at any offset, plus solid black bars |
+| **Fill-in** | Manga-specialised Fast Fourier Convolution inpainting model (default `lama`); `animagine` and `sdxl` diffusion models optional |
+| **Interfaces** | MCP server for Odysseus (`find_censored_regions`, `uncensor_image`, `uncensor_folder`) and `uncensor_cli.py` |
+| **Safety** | Originals are never touched and nothing is overwritten; results are new files |
+<!-- /datasheet:figure -->
 
 ## Uncensor
 
@@ -69,3 +96,7 @@ Odysseus's built-in `image_gen` tool needed an image endpoint and had none (it e
 - Verified through Odysseus's own `image_gen` MCP server: 1024×1024 in ~37 s, saved to the gallery. Needs Docker Model Runner running (it is, on port 12434).
 - Backups: `data/app.db.bak_imagegen_*`, `data/settings.json.bak_imagegen_*`, `data/app.db.bak_uncensor_*`. Undo = delete the `dmr_image` / `uncensor` rows and restore `image_model`.
 - Not yet driven from the chat window by the Qwen model (loading it alongside the image model is heavy on memory); the tool path below it is tested.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
