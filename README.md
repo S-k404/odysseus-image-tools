@@ -9,6 +9,8 @@
 
 # Odysseus image tools
 
+> **Purpose:** this tool is used for research and model optimisation for manga panels.
+
 Two things for the local Odysseus setup (`~/Documents/Docker/Odysseus`), kept out of Odysseus's own folders and its `.venv`:
 
 1. **Image generation** – already wired, nothing in this folder (see below).
